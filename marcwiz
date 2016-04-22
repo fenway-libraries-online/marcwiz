@@ -1,0 +1,986 @@
+#!/m1/shared/bin/perl
+
+use strict;
+use warnings;
+
+use MARC::Loop qw(marcparse TAG VALREF SUBS);
+use IPC::Run3 qw(run3);
+use YAML qw();
+use Getopt::Long
+    qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
+
+use constant YES => 'Y';
+use constant NO  => 'N';
+
+sub section;
+sub usage;
+sub ask;
+sub ask_bool;
+sub note;
+sub fatal;
+sub cancel;
+sub then;
+sub run_on;
+
+my (%question, %answer, %shelving_scheme, %shelving_order, %xlate);
+my @pipeline;
+my (%status, %rectype, %encoding);
+my ($marcf, $answf, $outf);
+my $sample_size = 500;
+my $randomize_sample;
+
+-t STDIN && -t STDOUT or fatal "This program must be run interactively from a terminal";
+GetOptions(
+    'a|answers-file=s' => \$answf,
+    's|sample-size=f' => \$sample_size,
+    'S|sample-all' => sub { $sample_size = 1.0 },
+    'o|output=s' => \$outf,
+) or usage;
+usage if @ARGV != 1;
+$randomize_sample = 1 if $sample_size =~ /[.]/;
+$marcf = shift @ARGV;
+
+init();
+
+print STDERR "Sampling MARC records...";
+my $count;
+my @sample = read_marc_records($marcf);
+my @mfhd_sample = grep { substr($_->[0], 6, 1) =~ /[uvxy]/  } @sample;
+my @auth_sample = grep { substr($_->[0], 6, 1) =~ /[z]/     } @sample;
+my @bib_sample  = grep { substr($_->[0], 6, 1) !~ /[uvxyz]/ } @sample;
+print STDERR "\n";
+
+print STDERR "Looking for already answered questions...";
+my $answfh = read_answers($marcf);
+print STDERR scalar(keys %answer) ? " found some\n" : " nope\n";
+
+answer('purpose') if !defined $answer{purpose};
+
+do_status();
+do_rectype();
+do_encoding();
+do_33x();
+do_035();
+do_remove_fields();
+do_add_fields();
+do_groom();
+do_spawn();
+
+section 'Finish';
+print STDERR "Answers have been saved in $answf\n";
+if (!defined $outf) {
+    my $options = {
+        w => 'Print it to the terminal',
+        o => -d 'bin' ? 'Save it to bin/prep' : 'Create bin/ and save it to bin/prep',
+        s => 'Save it to another file',
+    };
+    while (1) {
+        my $ans = ask_menu('What should I do with the generated script?',
+            'options' => [ qw(w o s) ],
+            'labels' => $options,
+            'default' => 'w',
+        );
+        if ($ans eq 'w') {
+            print "\n", '_' x 80, "\n", "\e[31;1mThe script\e[0m\n\n";
+            last;
+        }
+        elsif ($ans eq 'o') {
+            -d 'bin' or mkdir 'bin';
+            last if open STDOUT, '>', 'bin/prep';
+            print STDERR "I can't open bin/prep: $!\n";
+        }
+        else {
+            ask(\$outf, 'File name or path') or next;
+            last if open STDOUT, '>', $outf;
+            print STDERR "I can't open $outf: $!\n";
+        }
+    }
+    if (defined $outf) {
+        # chmod a+x
+        my $perm = (stat $outf)[2] & 07777;
+        chmod $perm | 0111, $outf;
+    }
+}
+
+# --- Print the script
+
+my $date = localtime;
+print "#!/bin/zsh\n\n# This script generated $date by marcwiz\n";
+while (@pipeline > 1) {
+    print quote_args(@{ shift @pipeline }), " |\n";
+}
+print quote_args(@{ shift @pipeline }), "\n\n";
+
+# write_answers($marcf, %answer);
+
+# --- Main code
+
+sub do_status {
+    section 'Record status';
+    my @statuses = keys %status;
+    if (@statuses > 1) {
+        note 'The records in this file have multiple record statuses';
+        if (answer('purpose') eq 'delete') {
+            then 'Change the record status to d (deleted)' => qw(marcprop -s d);
+        }
+        else {
+            then 'Change the record status to c (corrected or revised)' => qw(marcprop -s c);
+        }
+    }
+    elsif ($statuses[0] eq 'd') {
+        note 'The records in this file have status d (delete)';
+        if (answer('purpose') ne 'delete') {
+            then 'Change the record status to c (corrected or revised)' => qw(marcprop -s c);
+        }
+    }
+    elsif (grep { !/[acnp]/ } @statuses) {
+        note 'This file has some weird record statuses';
+        if (answer('fix-status', YES) eq YES) {
+            then 'Change the record status to c (corrected or revised)' => qw(marcprop -s c);
+        }
+    }
+    else {
+        note 'The record statuses look fine (adding or replacing)';
+    }
+}
+
+sub do_rectype {
+    section 'Record types';
+    my @rectypes = keys %rectype;
+    if (grep { /[uvxy]/ } @rectypes) {
+        if (!grep { /[^uvxy]/ } @rectypes) {
+            note 'This file contains only MFHDs';
+            if (answer('fetch-bibs-for-mfhds', YES) eq YES) {
+                fatal "I don't know how to do that yet";
+            }
+            else {
+                fatal "I can't do anything with a file of MFHDs";
+            }
+        }
+        else {
+            note 'This file contains MFHDs along with other stuff';
+            if (!answer('interleaved', YES)) {
+                fatal 'This file probably needs to be replaced';
+            }
+            if (answer('rewrite-mfhds') eq YES) {
+                fatal "I can't do that yet";
+            }
+            else {
+                fatal "I give up";
+            }
+        }
+    }
+    note "This file doesn't contain any MFHDs";
+}
+
+sub do_encoding {
+    section 'Record encodings';
+    my @encodings = keys %encoding;
+    if (@encodings > 1) {
+        note 'Uh-oh!  These records are in a mix of different encodings';
+        fatal "I don't know how to deal with that yet";
+    }
+    elsif ($encodings[0] eq 'a') {
+        note 'Records all seem to be in UTF-8 encoding';
+        then 'Make sure records are UTF-8' => qw(marcutf8 -u);
+    }
+    elsif ($encodings[0] eq ' ') {
+        note 'Records all seem to be in MARC8 encoding';
+        then 'Convert records to UTF-8' => qw(marcutf8 -m);
+    }
+    else {
+        note "Records are all in some other encoding ($encodings[0])";
+        then "Attempt to convert records to UTF-8" => qw(marcutf8 -f), $encodings[0];
+    }
+}
+
+sub ask_rda_33x {
+    my ($prompt, $str33x) = @_;
+    $str33x ||= 'txt,c,cr';
+    while (1) {
+        ask \$str33x, $prompt;
+        return $str33x if $str33x =~ /^([a-z]{1,3})(,[a-z]{1,3})*$/;
+    }
+}
+
+sub do_33x {
+    section 'RDA 33x fields';
+    if (answer('set-rda-33x-unconditionally', YES) eq YES) {
+        my $str33x = answer('rda-33x', 'txt,c,cr');
+        then 'Add RDA 33x fields ($str33x) replacing any existing 33x fields' => qw(marc33x -A), $str33x;
+    }
+    else {
+        then "Do not add 33x fields -- I hope you know what you're doing!";
+    }
+}
+
+sub do_035 {
+    section '035 fields';
+    my @f001 = all_control_field_values('001', @bib_sample);
+    my %f003 = map { $_ => 1 } all_control_field_values('003', @bib_sample);
+    my ($n001, $n003) = (scalar(@f001), scalar(keys %f003));
+    if ($n001 == @bib_sample) {
+        note 'These records appear to have 001 fields';
+        if ($n003 == 1) {
+            note "And they all have an 003 field = " . (values %f003)[0];
+            if (answer('build-035', YES) eq YES) {
+                then 'Build an 035 field from 001 and 003' => qw(marc-make-035);
+            }
+            else {
+                then 'Delete 001 and 003 fields' => qw(marcstrip -d), '001,003';
+            }
+        }
+        elsif ($n003 == 0) {
+            note 'But they do not have 003 fields';
+            then 'Delete 001 fields' => qw(marcstrip -d 001);
+        }
+        else {
+            oops("But their 003 fields aren't all the same");
+            then "Delete all 001 and 003 fields" => qw(marcstrip -d), '001,003';
+        }
+    }
+    elsif ($n001 != 0) {
+        note 'Some of these records have an 001 field, and some do not';
+        then 'Delete any 001 fields that are present' => qw(marcstrip -d 001);
+    }
+    else {
+        note 'It looks like none of these records have an 001 field';
+        if ($n003) {
+            then 'Delete the 003 fields' => qw(marcstrip -d 003);
+        }
+        else {
+            then "No 001 or 003 fields to deal with";
+        }
+    }
+    # Normalize OCLC numbers
+    if (answer('normalize-oclc-numbers', YES) eq YES) {
+        then 'Normalize OCLC numbers' => 'marc-normalize-oclc-numbers';
+    }
+}
+
+sub do_remove_fields {
+    section 'Fields to remove';
+    if (answer('strip-fields', NO) eq YES) {
+        my $fields = answer('fields-to-strip');
+        my @strip = @{ $fields->{strip} };
+        my @prune = @{ $fields->{prune} };
+        if (@strip) {
+            my $affected = list_to_human(sort @strip);
+            then "Strip all $affected fields" => qw(marcstrip -d), join(',', @strip);
+        }
+        if (@prune) {
+            my @cmd = qw(marcprune);
+            my %affected;
+            foreach (@prune) {
+                my ($tag, $condition) = @$_;
+                push @cmd, -c => "$tag $condition";
+                $affected{$tag} = 1;
+            }
+            my $affected = list_to_human(sort keys %affected);
+            then "Strip some $affected fields" => @cmd;
+        }
+    }
+}
+
+sub do_add_fields {
+    section 'Fields to add';
+    if (answer('add-fields', NO) eq YES) {
+        my $qtag = 'Enter a field tag, or blank to stop';
+        my @args;
+        while (1) {
+            print $qtag, ': ';
+            my $tag = <STDIN>;
+            last if $tag !~ /./;
+            chomp $tag;
+            if ($tag ge '010') {
+                my $qind = 'Enter both indicators (use # for a space)';
+                my ($ind, $sub, $con);
+                ask \$ind, $qind, sub { /^[#0-9]{2}$/ };
+                $ind =~ tr/#/ /;
+                my $qcon = 'Enter subfields one at a time (e.g., "$b foobar")';
+                my @subs;
+                while (1) {
+                    print $qcon, ': ';
+                    my $con = <STDIN>;
+                    last if $con !~ /./;
+                    $con =~ /^\$([a-z0-9])\s*(.+)$/ or print(STDERR "Huh?\n"), next;
+                    push @subs, '-'.$1 => $2;
+                    $qcon = 'Enter another subfield, or blank to stop';
+                }
+                print(STDERR "Cancelled\n"), next if !@subs;
+                push @args, $tag, -i => $ind, '[', @subs, ']';
+            }
+            else {
+                ask \my $con, 'Enter the field contents' or next;
+                push @args, $tag, $con;
+            }
+        }
+        if (@args) {
+            then 'Add field(s)', marcappend => @args;
+        }
+    }
+}
+
+sub ask_subfield {
+    my ($field, $prompt, $options, $default) = @_;
+    return ask_menu($prompt,
+        'options' => [ sort keys %$options ],
+        'labels' => $options,
+        'default' => $default,
+    );
+}
+
+sub ask_indicator {
+    my ($field, $num, $prompt, $options, $default) = @_;
+    return ask_menu($prompt,
+        'options' => [ sort keys %$options ],
+        'labels' => $options,
+        'default' => $default,
+    );
+###    my $xlate = $xlate{$field}{":$num"};
+###    my $prompt;
+###    my %ok;
+###    if (defined $xlate) {
+###        ($prompt, my $val2desc) = @$xlate;
+###        $prompt = "$field field indicator $num ($prompt)";
+###        %ok = %$val2desc;
+###    }
+###    else {
+###        $prompt = "$field field indicator $num";
+###        %ok = ( '#' => '(space)', map { $_ => $_ } 0..9 );
+###    }
+###    ask \$default, $prompt, sub { $ok{$_} }, \%ok;
+###    return $default;
+}
+
+sub do_spawn {
+    section 'MFHDs';
+    ### my @f852 = all_data_fields('852', @sample);
+    my %count852;
+    my $have852 = scalar grep {
+        my ($leader, $fields) = @$_;
+        my @f852 = grep { $_->[TAG] eq '852' } @$fields;
+        $count852{scalar @f852}++;
+        @f852;
+    } @sample;
+    if ($have852) {
+        note 'Aha!  There are 852 fields in these records';
+        my $maybe_strip;
+        if (scalar(keys %count852) > 1) {
+            $maybe_strip = 1;
+            if ($count852{0}) {
+                oops('Some have an 852 field and some do not');
+            }
+            else {
+                oops('The number of 852 fields varies from record to record');
+            }
+        }
+        else {
+            my ($n) = (keys %count852);
+            if ($n != 1) {
+                $maybe_strip = 1;
+                oops("They all have $n 852 fields, which is weird");
+            }
+        }
+        if ($maybe_strip) {
+            if (answer('strip-852-fields') eq YES) {
+                then "Delete all 852 fields" => qw(marcstrip -d 852);
+            }
+            else {
+                then "Leave 852 fields";
+            }
+        }
+    }
+    if (answer('create-mfhds', YES) eq YES) {
+        my @cmd = qw(marcspawn);
+        my $location = answer('location');
+        push @cmd, -b => $location;
+        if (answer('purpose') ne 'delete') {
+            my $ind1 = ask_indicator(852, 1, 'Shelving scheme', {
+                '#' => 'No information provided',
+                '0' => 'Library of Congress classification',
+                '1' => 'Dewey Decimal classification',
+                '2' => 'National Library of Medicine classification',
+                '3' => 'Superintendent of Documents classification',
+                '4' => 'Shelving control number',
+                '5' => 'Title',
+                '6' => 'Shelved separately',
+                '7' => 'Source specified in subfield $2',
+                '8' => 'Other scheme',
+            }, '8');
+            my $ind2 = ask_indicator(852, 2, 'Shelving order', {
+                '#' => 'No information provided',
+                '0' => 'Not enumeration',
+                '1' => 'Primary enumeration',
+                '2' => 'Alternative enumeration',
+            }, '#');
+            push @cmd, -1 => unblank($ind1), -2 => unblank($ind2);
+            if (answer('add-vendor', YES) eq YES) {
+                my $vendor = answer('vendor');
+                my $subfield = answer('vendor-subfield');
+                if (defined $subfield) {
+                    then "Add vendor to 856 \$$subfield";
+                    push @cmd, -h => $vendor;
+                }
+            }
+        }
+        then 'Build MFHDs' => @cmd;
+        # Deal with 856 fields
+        my @f856 = all_data_fields('856', @bib_sample);
+        if (@f856 == 0) {
+            note 'None of the records has an 856 field';
+        }
+        elsif (answer('devolve-856', YES) eq YES) {
+            # marc-devolve-856 -r 0 -E -Z $note -p "${proxy}%s" 
+            # marcproxy $proxy
+            @cmd = qw(marc-devolve-856);
+            # Make sure we can devolve URLs for the resource itself, and nothing else (like TOC links)
+            my %ind2 = map { $_ => 1 } all_indicators(2, @f856);
+            my @ind2 = keys %ind2;
+            my $cmp = @f856 <=> @bib_sample;
+            if ($cmp == 0) {
+                # @f856 == @bib_sample
+                note 'It looks like each record has a single 856 field, which is good';
+            }
+            elsif ($cmp == 1) {
+                # @f856 > @bib_sample
+                note 'Some records have more than one 856 field, which complicates things';
+                my $num_to_move = ($ind2{0} || 0) + ($ind2{1} || 0);
+                if ($num_to_move == @f856) {
+                    note 'Fortunately, they seem to be coded correctly';
+                    note "I'll move all 856 fields with indicator 2 (relationship) set to 0 (resource) or 1 (version of resource) to the MFHD, but leave any other 856 fields in the bib record";
+                    push @cmd, -r => 0, -r => 1;
+                }
+                else {
+                    note 'Uh-oh, there are indicator coding problems';
+                    note "I'll move all of the 856 fields, but this may cause problems";
+                }
+            }
+            else {
+                # @f856 < @bib_sample
+                note "Some records don't have an 856 field";
+            }
+            # Deal with URLs
+            my @s856u = all_subfield_values('u', @f856);
+            my (%proxy_prefix, $unproxied);
+            foreach (@s856u) {
+                if (m{^(https?://.+/login\?url=)}) {
+                    $proxy_prefix{$1}++;
+                }
+                else {
+                    $unproxied++;
+                }
+            }
+            my $proxy_prefixes = scalar keys %proxy_prefix;
+            if ($proxy_prefixes == 1 && $unproxied == 0) {
+                note 'All of the URLs in 856 $u are proxied using ', keys %proxy_prefix;
+            }
+            elsif ($proxy_prefixes == 0) {
+                note 'None of the URLs in 856 $u have a proxy prefix';
+                if (answer('add-proxy-prefix', YES) eq YES) {
+                    my $pfx = answer('proxy-prefix');
+                    note 'I will add the proxy prefix';
+                    push @cmd, -p => "${pfx}%s";
+                }
+            }
+            else {
+                note "Some 856 \$u fields have a proxy prefix, and some don't";
+                note "I can't fix this, so I just leave them all as is";
+            }
+            push @cmd, qw(-E);
+            my $label = answer('link-label');
+            push @cmd, -Z => $label;
+            then "Move all 856 fields to the MFHD with changes" => @cmd;
+        }
+    }
+}
+
+sub do_groom {
+    section 'Field sorting';
+    if (answer('groom', YES) eq YES) {
+        then 'Sort fields' => qw(marcgroom -012346789);
+    }
+}
+
+sub ask_fields_to_strip {
+    print STDERR q{
+
+I'm going to ask you which fields should be removed.  You can specify any
+number of fields, but just one at a time please.
+
+To remove all instances of a particular field, enter its tag all by itself.
+
+To remove a field based on some condition, enter the tag followed by the
+condition.  For example, to remove all 650 fields whose second indicator is not
+zero:
+
+    650 :2 != 0
+
+Or to remove all 711 fields with a subfield $a containing the string C<Knovel>
+(case-insensitive):
+
+    711 $a ~ knovel
+
+See marcprune(1) for details on the conditions.
+
+};
+    my (@fields, @prune, @strip);
+    my %fields = (
+        prune => \@prune,
+        strip => \@strip,
+    );
+    if (ask_many(\@fields, 'Enter a field, or blank to stop', qr/^[A-Za-z0-9]{3}/)) {
+        foreach (@fields) {
+            s/^(...)\s*\$?//;
+            my $tag = $1;
+            if (length) {
+                push @prune, [ $tag, $_ ];
+            }
+            else {
+                push @strip, $tag;
+            }
+        }
+    }
+    else {
+        note 'OK, never mind';
+    }
+    return \%fields;
+}
+
+# --- Functions
+
+sub answer {
+    my ($key, @args) = @_;
+    return $answer{$key} if exists $answer{$key};
+    my $val = $question{$key}->(@args);
+    my ($head, $body) = split /\n/, YAML::Dump({$key => $val}), 2;
+    print $answfh $body;
+    return $val;
+    print $answfh "$key $val\n";
+    return $val;
+}
+
+sub list_to_human {
+    return $_[0] if @_ == 1;
+    return "$_[0] and $_[1]" if @_ == 2;
+    my $last = 'and ' . pop @_;
+    return join(', ', @_, $last);
+}
+
+sub ask_many {
+    my ($ary, $question, $rx) = @_;
+    while (1) {
+        print STDERR $question, ': ';
+        local $_ = <STDIN>;
+        last if !/./;
+        oops("Illegal value: $_"), next if defined($rx) && $_ !~ $rx;
+        chomp;
+        push @$ary, $_;
+    }
+    return @$ary;
+}
+
+sub ask_bool {
+    my ($question, $default) = @_;
+    print shift, '? ';
+    print $default eq YES ? '[Yn] ' : '[yN] ' if defined $default;
+    my $str = <STDIN>;
+    print(STDERR "Cancelled\n"), exit 2 if !defined $str || $str =~ /^[Qq]/;
+    $str = $default if $str !~ /./;
+    while (!defined $str || $str !~ /^[YyNn]/) {
+        print "\nPlease answer Y or N (or yes, no, etc.): ";
+        $str = <STDIN>;
+    }
+    return $str =~ /^[Yy]/ ? YES : NO;
+}
+
+sub ask_purpose {
+    my %ok = map { $_ => 1 } qw(add replace delete);
+    my $purpose = 'add';
+    ask \$purpose, 'Record load purpose (add, replace, or delete)', qr/^(add|replace|delete)$/;
+}
+
+sub ask_menu {
+    my ($prompt, %arg) = @_;
+    my $default = $arg{default};
+    my @options = @{ $arg{options} };
+    my %label = %{ $arg{labels} };
+    my $noptions = scalar @options;
+    my $nlabel = scalar keys %label;
+    if ($nlabel == 0) {
+        die if $nlabel != $noptions;
+        my $i = 0;
+        foreach (@options) {
+            $label{$_} = sprintf('%2s ', ++$i);
+        }
+    }
+    print STDERR "\n", $prompt, "\n";
+    my $w = 0;
+    foreach (@options) {
+        $w = length if length > $w;
+    }
+    foreach (@options) {
+        printf STDERR "    \e[36;1m%-${w}.${w}s\e[0m  %s\n", $_, $label{$_};
+    }
+    my $choice;
+    $prompt = 'Your choice: ';
+    $prompt .= "[$default] " if defined $default;
+    while (1) {
+        print STDERR $prompt;
+        $choice = <STDIN>;
+        chomp $choice;
+        $choice = $default if !length $choice;
+        $choice = '' if !defined $label{$choice};
+        last if length $choice;
+        print STDERR "That is not a valid option\n";
+    }
+    return $choice;
+}
+
+sub ask {
+    my ($ref, $prompt, $filter, $enum) = @_;
+    if (!defined $filter) {
+        $filter = sub { 1 };
+    }
+    elsif (ref($filter) ne 'CODE') {
+        my $rx = qr/^$filter$/;
+        $filter = sub { $_ =~ $rx };
+    }
+    my @allowed;
+    while (1) {
+        print $prompt, ': ';
+        print '[', $$ref, '] ' if defined $$ref;
+        local $_ = <STDIN>;
+        fatal if !defined;
+        chomp;
+        if (/^$/) {
+            last if defined $$ref;
+        }
+        elsif ($filter->()) {
+            $$ref = $_;
+            last;
+        }
+        elsif (defined $enum) {
+            @allowed = allowed(%$enum) if !@allowed;
+            print "Allowed values:\n";
+            print "    $_\n" for @allowed;
+        }
+    }
+    return $$ref;
+}
+
+sub all_control_field_values {
+    my $tag = shift;
+    my @values;
+    foreach (@_) {
+        my ($ldr, $flds) = @$_;
+        foreach my $fld (@$flds) {
+            push @values, ${ $fld->[VALREF] } if $fld->[TAG] eq $tag;
+        }
+    }
+    return @values;
+}
+
+sub all_data_fields {
+    my $tag = shift;
+    my @fields;
+    foreach (@_) {
+        my ($ldr, $flds) = @$_;
+        foreach my $fld (@$flds) {
+            push @fields, $fld if $fld->[TAG] eq $tag;
+        }
+    }
+    return @fields;
+}
+
+sub all_indicators {
+    my $i = shift;
+    my @indicators;
+    foreach (@_) {
+        push @indicators, substr(${ $_->[VALREF] }, $i-1, 1);
+    }
+    return @indicators;
+}
+
+sub all_subfield_values {
+    my $sub = shift;
+    my @values;
+    foreach (@_) {
+        my @subs = @$_[SUBS..$#$_];
+        push @values, map { $_->[0] eq $sub ? ( ${$_->[1]} ) : () } @subs;
+    }
+    return @values;
+}
+
+sub read_marc_records {
+    my ($marcf) = @_;
+    open my $marcfh, '<', $marcf or fatal "open $marcf: $!";
+    $count = qx{marccount < "$marcf"};
+    chomp $count;
+    if ($randomize_sample && $count * $sample_size < 100) {
+        $sample_size = 100;
+        undef $randomize_sample;
+    }
+    my @sample;
+    local $/ = "\x1d";
+    while (defined(my $marc = <$marcfh>)) {
+        $status{   substr($marc, 5, 1) }++;
+        $rectype{  substr($marc, 6, 1) }++;
+        $encoding{ substr($marc, 9, 1) }++;
+        if ($randomize_sample) {
+            next if rand > $sample_size;
+        }
+        else {
+            next if @sample >= $sample_size;
+        }
+        push @sample, [marcparse(\$marc)];
+    }
+    print STDERR "\n";
+    return @sample;
+}
+
+sub read_answers {
+    my ($marcf) = @_;
+    ($answf = $marcf) =~ s/(\.mrc)?$/.mwiz/
+        if !defined $answf;
+    open $answfh, '+>>', $answf or fatal "open $answf: $!";
+    seek $answfh, 0, 0;
+    local $/;
+    my $yaml = <$answfh>;
+    $yaml = '--- {}' if $yaml !~ /\S/;
+    %answer = %{ YAML::Load($yaml) };
+    return $answfh;
+    while (<$answfh>) {
+        next if /^\s*(?:#.*)?$/;  # Skip blank lines and comments
+        chomp;
+        if (/^(\S+) (.*)/) {
+            $answer{$1} = $2 if length $2;
+        }
+        else {
+            print STDERR "marcwiz: warning: unrecognized line in answers file $answf: $_";
+        }
+    }
+    return $answfh;
+}
+
+sub write_answers {
+    my ($marcf, %ans) = @_;
+    ($answf = $marcf) =~ s/(\.mrc)?$/.mwiz/
+        if !defined $answf;
+    my $fh;
+    if (-e $answf) {
+        note 'The answers file already exists: $answf';
+        my $choice = ask_menu('What should I do?',
+            options => [qw(o m s)],
+            labels => {
+                o => 'overwrite it',
+                m => 'move it out of the way',
+                s => 'save answers to a different file',
+            },
+            default => 'm',
+        );
+        if ($choice eq 'o') {
+            # Nothing special to do
+        }
+        elsif ($choice eq 'm') {
+            my $backup = $answf.'~';
+            unlink $backup if -e $backup;
+            rename $answf, $backup;
+        }
+        elsif ($choice eq 's') {
+            undef $answf;
+            $answf = ask(\$answf, 'Save as:');
+        }
+    }
+    open $fh, '>', $answf or die;
+    while (my ($k, $v) = each %ans) {
+        print $fh "$k $v\n";
+    }
+}
+
+sub allowed {
+    my %enum = @_;
+    return map {
+        my $e = $enum{$_};
+        defined $e && length $e ? "$_ = $e" : $_;
+    } sort keys %enum;
+}
+
+sub usage {
+    print STDERR "\e[1musage: marcwiz FILE\e[0m\n";
+    exit 1;
+}
+
+sub fatal {
+    print STDERR "\e[31;1m$_\e[0m\n" for @_;
+    exit 2;
+}
+
+sub section {
+    print STDERR "\n", '_' x 80, "\n", "\e[33;1m", @_, "\e[0m", "\n";
+}
+
+sub note {
+    print STDERR "\n\e[32;1m", @_, "\e[0m", "\n";
+}
+
+sub oops {
+    print STDERR "\n\e[31;1m", @_, "\e[0m", "\n";
+}
+
+sub then {
+    print STDERR "\n  => ", shift, "\n";
+    return if !@_;
+    print STDERR "     \e[1m", quote_args(@_), "\e[0m\n";
+    push @pipeline, [ @_ ];
+}
+
+sub quote_args {
+    join ' ', map {
+        /"/      ? s/"/\\"/g && s/[$]/\\\$/g && qq{"$_"} :
+        /'/      ? qq{"$_"}              :
+        /[\$\s]/ ? qq{'$_'}              :
+                 $_
+    } @_;
+}
+
+sub run_on {
+    my $write_to_child = shift;
+    my (@out, @err);
+    seek $write_to_child, 0, 0;
+    run3([@_], $write_to_child, \@out, \@err);
+    chomp @out;
+    return @out;
+}
+
+sub unblank {
+    local $_ = shift;
+    tr/#/ /;
+    return $_;
+}
+
+sub init {
+    %question = (
+        'purpose'       => sub { ask_purpose(), @_ },
+        'fix-status'    => sub { ask_bool('Should I change them all to c (corrected or revised)', @_) },
+        'fetch-bibs-for-mfhds'
+                        => sub { ask_bool('Do you want to fetch their bibs from Voyager at record prep time', @_) },
+        'interleaved'   => sub { ask_bool('Is it a file of interleaved bibs and MFHDs', @_) },
+        'rewrite-mfhds' => sub { ask_bool('Are you trying to rewrite the MFHDs in some way', @_) },
+        'set-rda-33x-unconditionally'
+                        => sub { ask_bool('Do you want to set the RDA 33x fields for every record', @_) },
+        'rda-33x'       => sub { ask_rda_33x('Enter a set of 33x field codes separated by commas', @_) },
+        'build-035'     => sub { ask_bool('Should I use these fields to build an 035 field', @_) },
+        'normalize-oclc-numbers'
+                        => sub { ask_bool('Do you want to normalize OCLC numbers', @_) },
+        'strip-fields'  => sub { ask_bool('Do any fields need to be removed', @_) },
+        'fields-to-strip'
+                        => sub { ask_fields_to_strip(@_) },
+        'add-fields'    => sub { ask_bool('Do any fields need to be added', @_) },
+        'fields-to-add' => sub { ask_fields_to_add(@_) },
+        'create-mfhds'  => sub { ask_bool('Do you want to create MFHDs', @_) },
+        'add-vendor'    => sub { ask_bool('Do you want to add the vendor name in each 852 field', @_) },
+        'vendor'        => sub { ask(\my $vendor, 'Vendor name', @_) },
+        'vendor-subfield'
+                        => sub { ask_subfield('852', 'Which subfield should it go in', { h => 'Classification part', k => 'Call number prefix' }, 'h') },
+        'location'      => sub { ask(\my $location, 'Location code', @_) },
+        'devolve-856'   => sub { ask_bool('Move 856 field from bib to MFHD', @_) },
+        'groom'         => sub { ask_bool('Group fields by the first character of their tags', @_) },
+        'strip-852-fields'
+                        => sub { ask_bool('Should I strip all 852 fields', @_) },
+        'add-proxy-prefix'
+                        => sub { ask_bool('Should I add a proxy prefix', @_) },
+        'proxy-prefix'  => sub { ask(\my $add_proxy, 'Enter the proxy prefix', @_) },
+    );
+    %shelving_scheme = qw(
+        0   LC
+        1   Dewey
+        2   NLM
+        8   Other
+    );
+    %shelving_order = (
+        '#' => 'No information provided',
+        '0' => 'Not enumeration',
+    );
+    %xlate = (
+        852 => {
+            ':1' => [ 'Shelving scheme' => \%shelving_scheme ],
+            ':2' => [ 'Shelving order' => \%shelving_order ],
+        },
+    );
+}
+
+__END__
+marc-fix-leader
+marcappend $add
+marcappend $add_fields
+marcappend $additions
+marcappend $field852
+marcappend -zm 007 'cr bn||||m|||a'
+marcappend 003 CMalG
+marcappend 049 [ -a $oclc ]
+marcappend 049 [ -a $oclcsym ]
+marcappend 655 -27 [ -a 'Electronic books.' -2 lcgft ]
+marcappend 710 -1 2 [ -a "Knovel (Firm)" ]
+marcappend 710 -1 2 [ -a $springerlink ]
+marcappend 830 -2 0 [ -a $series ]
+marcasm <<EOS
+marcfmerge -H 852hikx
+marcftidy -B 856 -14 -22
+marcftidy -H 856 -d 3
+marcftidy -H 856 -s u+
+marcftidy -H 856 -s u+                          
+marcftidy -ed
+marcgroom -0 -3 -8
+marcgroom -0 -6 -8
+marcgroom -0 -7 -8
+marcgroom -0 -8
+marcgroom -0 -8               
+marcgroom -0 -8                                    
+marcgroom -03
+marcgroom -078
+marcins -b 856 '@u()$' -z 'Discussion guide available for free from MEF'
+marcins -h 852 '@$' -x $privnote
+marcins -h 852 -k $ven
+marcins 049! -a $oclc
+marcmove '856~Table of contents' 956
+marcmove -11 -RM $ebook 020a 776z
+marcmove -B 956 856
+marcmove -H 890 852
+marcmove -H 891 852
+marcmove -H 892 852
+marcmove -H 893 852
+marcmove -R -f '(OCoLC)%d' 001 035a
+marcmove -c -a '856u~\?p=(\d+)$' '035a=(AUPeEL)%d'
+marcmove -c -t ebl2bib.txt '856u~\?p=(\d+)$' 951a
+marcmove -c 050a 891h
+marcmove -c 050b 892i
+marcmove -c 590a 890k
+marcmove -c 590b 893x
+marcmove -pcm '^EBL\d+' -f '(AU-PeEL)%s' 938n 035a
+marcmove -pcm '^ebr' -f '(CaPaEBR)%s' 938n 035a   
+marcmunge "856u { s{^\Q${proxy}\E}{} }"
+marcmunge $fixdomain
+marcmunge '035a { s/ +$// }'
+marcmunge '100a { s/ $// }' \              
+marcmunge '264a { s/Hong King/Hong Kong/ }'
+marcmunge '300a { s/1 online resource/1 streaming video/ }'
+marcmunge '590b { s/.*Patron Driven Acquisitions.*/PDA/ }'
+marcmunge '650z { s/ +$// }' '6552 { s/ +$// }'
+marcmunge '776i { s/ +$// }'
+marcmunge '856:2 {
+marcmunge '856:2 { $_ = 0 }'
+marcmunge -B '* { s/(?:\s*\xc2\xa0\s*)+/ /g }'
+marcmunge -H '856u { s{\?sid=OCLC:WCDS$}{} }'
+marcmunge -l 'substr($_, 17, 1) = "1"'          
+marcmunge -l 'substr($_, 17, 1) = "u"'
+marcprop -s d
+marcspawn        -18 -20 -b $loc
+marcspawn        -18 -20 -b $loc -h $vendor
+marcspawn -k 856 -18 -20 -b $loc
+marcspawn -k 856 -18 -20 -b $loc -h $ven
+marcspawn -k 856 -18 -20 -b $loc -h $vendor
+marcspawn -k 856 -18 -20 -b $loc -h $vendor
+marcspawn -k 856 -18 -20 -b $loc -h $vendor
+marcspawn -k 856 -18 -20 -b $location -h $vendor
+marcspawn -k 856 -18 -20 -b $location -m 890,891,892,893
