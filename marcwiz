@@ -37,7 +37,7 @@ GetOptions(
     'o|output=s' => \$outf,
 ) or usage;
 usage if @ARGV != 1;
-$randomize_sample = 1 if $sample_size =~ /[.]/;
+$randomize_sample = 1 if $sample_size =~ s/[.,]/./;
 $marcf = shift @ARGV;
 
 init();
@@ -741,7 +741,7 @@ sub read_marc_records {
 
 sub read_answers {
     my ($marcf) = @_;
-    ($answf = $marcf) =~ s/(\.mrc)?$/.mwiz/
+    ($answf = $marcf) =~ s/(\.mrc)?$/.wiz/
         if !defined $answf;
     open $answfh, '+>>', $answf or fatal "open $answf: $!";
     seek $answfh, 0, 0;
@@ -765,7 +765,7 @@ sub read_answers {
 
 sub write_answers {
     my ($marcf, %ans) = @_;
-    ($answf = $marcf) =~ s/(\.mrc)?$/.mwiz/
+    ($answf = $marcf) =~ s/(\.mrc)?$/.wiz/
         if !defined $answf;
     my $fh;
     if (-e $answf) {
